@@ -17,7 +17,6 @@ import streamlit as st
 
 st.set_page_config(
     page_title="Mapa ERP → OCI IAM",
-    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
