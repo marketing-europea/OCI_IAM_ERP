@@ -2,1951 +2,686 @@ from __future__ import annotations
 
 import io
 import json
-import re
-import unicodedata
 import zipfile
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from analysis_core import (
+    Inventory,
+    build_capability_mapping,
+    build_role_mapping,
+    compare_roles,
+    duplicate_privilege_definitions,
+    filter_snapshot,
+    load_consolidated,
+    load_legacy,
+    privilege_sets,
+    role_summary,
+    user_redundancy,
+)
 
-# ============================================================
-# CONFIGURACIÓN GENERAL
-# ============================================================
 
 st.set_page_config(
-    page_title="Mapa ERP → OCI IAM",
+    page_title="ERP → OCI | Analizador de roles",
+    page_icon="🔐",
     layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-CUSTOM_USER_URN = (
-    "urn:ietf:params:scim:schemas:idcs:extension:custom:User"
-)
-
-DOCUMENTACION_OCI = {
-    "Esquema SCIM de OCI IAM":
-        "https://docs.oracle.com/en-us/iaas/Content/Identity/"
-        "api-getstarted/OCISSchema.htm",
-
-    "Atributos personalizados":
-        "https://docs.oracle.com/en-us/iaas/Content/Identity/"
-        "api-getstarted/schemacustomization.htm",
-
-    "Claims personalizados":
-        "https://docs.oracle.com/en-us/iaas/Content/Identity/"
-        "api-getstarted/custom-claims-token.htm",
-
-    "Scopes OAuth/OIDC":
-        "https://docs.oracle.com/en-us/iaas/Content/Identity/"
-        "api-getstarted/Scopes.htm",
-
-    "Gestión de grupos":
-        "https://docs.oracle.com/en-us/iaas/Content/Identity/"
-        "groups/managinggroups.htm",
-}
-
-
-# ============================================================
-# REGLAS ORIENTATIVAS
-# ============================================================
-
-REGLAS_FAMILIA = [
-    (
-        "SINIESTROS",
-        r"SINIEST|RESERV|PRESTACION|PROFESIONAL|CUADRO_MED|URGEN",
-    ),
-    (
-        "MEDIADOR",
-        r"MEDIADOR|TESTER.?MED|RED_AGENT|ASESOR|COLABORADOR_MED",
-    ),
-    (
-        "COMERCIAL",
-        r"COMERCIAL|CRM|CLIENTE|AGENDA|SUSCRIPTOR",
-    ),
-    (
-        "CONTABILIDAD_FINANZAS",
-        r"COBRO|RECIBO|LIQUID|PAGO|FINAN|COMISION|REAJUST",
-    ),
-    (
-        "POLIZAS_PRODUCTO",
-        r"POLIZ|TARIFIC|EMITIR|PRODUC|D100|D300|D400|D475|D490|D600|TAR75",
-    ),
-    (
-        "ADMINISTRACION",
-        r"ADMINISTR|SERVICIOS_CENTRALES|CONTROL.?GESTION",
-    ),
-    (
-        "TECNOLOGIA",
-        r"DESARROLLO|INTEGRACION|SAP|FIRMA_DIGITAL",
-    ),
-    (
-        "REASEGURO_ACTUARIAL",
-        r"REASEGURO|ACTUARIO",
-    ),
-]
-
-REGLAS_CAPACIDAD = [
-    ("CONSULTAR", r"CONSULT"),
-    ("TARIFICAR", r"TARIFIC|SOLOTAR|TAR_Y"),
-    ("EMITIR", r"EMIT|EMI_"),
-    ("ANULAR", r"ANUL"),
-    ("GESTIONAR_COBROS", r"COBRO|RECIBO"),
-    ("GESTIONAR_LIQUIDACIONES", r"LIQUID"),
-    ("GESTIONAR_COMISIONES", r"COMISION"),
-    ("GESTIONAR_SINIESTROS", r"SINIEST"),
-    ("MODIFICAR_RESERVAS", r"RESERVAS_MODIFICACION"),
-    ("CIERRE_MEDIADOR", r"CONCIERRE|CIERREMEDIADOR"),
-    ("GESTIONAR_POLIZAS", r"GESTION_POLIZAS"),
-    ("ADMINISTRAR", r"ADMINISTR"),
-]
-
-FAMILIAS_DISPONIBLES = [
-    "MEDIADOR",
-    "SINIESTROS",
-    "COMERCIAL",
-    "CONTABILIDAD_FINANZAS",
-    "POLIZAS_PRODUCTO",
-    "ADMINISTRACION",
-    "TECNOLOGIA",
-    "REASEGURO_ACTUARIAL",
-    "POR_CLASIFICAR",
-]
-
-CAPACIDADES_DISPONIBLES = [
-    "SIN_CLASIFICAR",
-    "CONSULTAR",
-    "TARIFICAR",
-    "EMITIR",
-    "MODIFICAR",
-    "ANULAR",
-    "CERRAR",
-    "GESTIONAR_COBROS",
-    "GESTIONAR_LIQUIDACIONES",
-    "GESTIONAR_COMISIONES",
-    "GESTIONAR_SINIESTROS",
-    "MODIFICAR_RESERVAS",
-    "CIERRE_MEDIADOR",
-    "GESTIONAR_POLIZAS",
-    "SUPERVISAR",
-    "ADMINISTRAR",
-    "NO_MIGRAR_A_OCI",
-]
-
-
-# ============================================================
-# ATRIBUTOS PROPUESTOS
-# ============================================================
-
-ATRIBUTOS_PROPUESTOS = [
-    {
-        "origen_erp": "ID_DUSUARIOS_FK",
-        "destino_oci": "externalId",
-        "esquema": "SCIM core",
-        "tipo_oci": "string",
-        "obligatorio": True,
-        "claim_oidc": "erp_user_id",
-        "estado": "Propuesto",
-        "observacion":
-            "Identificador estable: ERP:<ID_DUSUARIOS_FK>.",
-    },
-    {
-        "origen_erp": "USUARCOD",
-        "destino_oci": "userName",
-        "esquema": "SCIM core",
-        "tipo_oci": "string",
-        "obligatorio": True,
-        "claim_oidc": "preferred_username",
-        "estado": "Pendiente de fichero",
-        "observacion":
-            "No está en los CSV actuales. Comprobar unicidad.",
-    },
-    {
-        "origen_erp": "EMAIL",
-        "destino_oci": "emails[type=work].value",
-        "esquema": "SCIM core",
-        "tipo_oci": "complex",
-        "obligatorio": True,
-        "claim_oidc": "email",
-        "estado": "Pendiente de fichero",
-        "observacion":
-            "No está en los CSV actuales.",
-    },
-    {
-        "origen_erp": "NOMBRE",
-        "destino_oci": "name.givenName",
-        "esquema": "SCIM core",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "given_name",
-        "estado": "Pendiente de fichero",
-        "observacion":
-            "Usar el atributo estándar de SCIM.",
-    },
-    {
-        "origen_erp": "APELLIDOS",
-        "destino_oci": "name.familyName",
-        "esquema": "SCIM core",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "family_name",
-        "estado": "Pendiente de fichero",
-        "observacion":
-            "Usar el atributo estándar de SCIM.",
-    },
-    {
-        "origen_erp": "ESTADO_USUARIO",
-        "destino_oci": "active",
-        "esquema": "SCIM core",
-        "tipo_oci": "boolean",
-        "obligatorio": True,
-        "claim_oidc": "",
-        "estado": "Pendiente de fichero",
-        "observacion":
-            "Definir reglas de alta, suspensión, baja y reactivación.",
-    },
-    {
-        "origen_erp": "TIPO_USUARIO",
-        "destino_oci": "erpTipoUsuario",
-        "esquema": "Custom User",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "erp_tipo_usuario",
-        "estado": "Propuesto",
-        "observacion":
-            "Recomendable definir un catálogo cerrado de valores.",
-    },
-    {
-        "origen_erp": "NIVEL_TRANSACCIONAL",
-        "destino_oci": "erpNivel",
-        "esquema": "Custom User",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "erp_nivel",
-        "estado": "Propuesto",
-        "observacion":
-            "Tratarlo como código si no se realizan cálculos.",
-    },
-    {
-        "origen_erp": "prefijo(USUARCOD)",
-        "destino_oci": "erpCodigoMediador",
-        "esquema": "Custom User",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "erp_codigo_mediador",
-        "estado": "Propuesto",
-        "observacion":
-            "Mantener ceros iniciales y formalizar la regla de extracción.",
-    },
-    {
-        "origen_erp": "DELEGACION",
-        "destino_oci": "erpDelegacion",
-        "esquema": "Custom User",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "erp_delegacion",
-        "estado": "Propuesto",
-        "observacion":
-            "Revisar si encaja mejor en SCIM Enterprise department.",
-    },
-    {
-        "origen_erp": "EMPRESA",
-        "destino_oci": "erpEmpresa",
-        "esquema": "Custom User",
-        "tipo_oci": "string",
-        "obligatorio": False,
-        "claim_oidc": "erp_empresa",
-        "estado": "Propuesto",
-        "observacion":
-            "Revisar si encaja mejor en SCIM Enterprise organization.",
-    },
-]
-
-
-# ============================================================
-# ESTILO
-# ============================================================
-
-st.markdown(
-    """
-    <style>
-        .stApp {
-            background:
-                linear-gradient(135deg, #07131f 0%, #0b1d2b 50%, #102839 100%);
-        }
-
-        [data-testid="stSidebar"] {
-            background: #081722;
-            border-right: 1px solid #17394c;
-        }
-
-        .cabecera {
-            padding: 1.7rem 2rem;
-            margin-bottom: 1rem;
-            border: 1px solid #1d4c64;
-            border-radius: 18px;
-            background:
-                linear-gradient(
-                    120deg,
-                    rgba(18, 59, 78, 0.95),
-                    rgba(8, 24, 36, 0.95)
-                );
-        }
-
-        .cabecera h1 {
-            margin: 0 0 0.4rem 0;
-        }
-
-        .cabecera p {
-            margin: 0;
-            color: #bad0dc;
-        }
-
-        .aviso {
-            padding: 1rem 1.2rem;
-            margin: 0.6rem 0 1rem 0;
-            border-left: 4px solid #2dd4bf;
-            border-radius: 8px;
-            background: #0a2230;
-        }
-
-        .aviso-amarillo {
-            border-left-color: #f59e0b;
-            background: #2a2112;
-        }
-
-        div[data-testid="stMetric"] {
-            padding: 1rem;
-            border: 1px solid #173f52;
-            border-radius: 14px;
-            background: #0c2432;
-        }
-
-        div[data-testid="stMetricValue"] {
-            color: #5eead4;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
 )
 
 st.markdown(
     """
-    <div class="cabecera">
-        <h1>Mapa de identidad ERP → OCI IAM</h1>
-        <p>
-            Analiza perfiles y funciones, compara variantes, diseña atributos
-            SCIM y simula la información que recibirá el ERP mediante OIDC.
-        </p>
-    </div>
-    """,
+<style>
+div[data-testid="stMetric"] {background:#f6f8fb;border:1px solid #e5e9f0;padding:14px;border-radius:12px}
+.small-note {color:#536273;font-size:.92rem}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
 
-# ============================================================
-# FUNCIONES AUXILIARES
-# ============================================================
-
-def normalizar_texto(valor: object) -> str:
-    texto = unicodedata.normalize("NFKD", str(valor or ""))
-    texto = "".join(
-        caracter
-        for caracter in texto
-        if not unicodedata.combining(caracter)
-    )
-    texto = texto.upper()
-    texto = re.sub(r"[^A-Z0-9]+", "_", texto)
-    return texto.strip("_")
+@st.cache_data(max_entries=2, show_spinner=False)
+def cached_consolidated(raw: bytes, name: str) -> Inventory:
+    return load_consolidated(raw, name)
 
 
-def leer_csv_subido(archivo) -> pd.DataFrame:
-    """
-    Lee el archivo exclusivamente en memoria.
-
-    No se guarda en disco y no se envía a servicios externos.
-    """
-    contenido = archivo.getvalue()
-
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            return pd.read_csv(
-                io.BytesIO(contenido),
-                encoding=encoding,
-            )
-        except UnicodeDecodeError:
-            continue
-
-    raise ValueError(
-        f"No se pudo detectar la codificación de {archivo.name}"
-    )
+@st.cache_data(max_entries=2, show_spinner=False)
+def cached_legacy(
+    user_roles_raw: bytes,
+    role_functions_raw: bytes,
+    roles_raw: bytes,
+    functions_raw: bytes | None,
+) -> Inventory:
+    return load_legacy(user_roles_raw, role_functions_raw, roles_raw, functions_raw)
 
 
-def validar_columnas(
-    dataframe: pd.DataFrame,
-    columnas_obligatorias: set[str],
-    nombre_fichero: str,
-) -> None:
-    columnas_faltantes = (
-        columnas_obligatorias - set(dataframe.columns)
-    )
-
-    if columnas_faltantes:
-        faltantes = ", ".join(sorted(columnas_faltantes))
-        raise ValueError(
-            f"{nombre_fichero}: faltan las columnas {faltantes}"
-        )
+@st.cache_data(max_entries=6, show_spinner=False)
+def cached_comparisons(
+    inventory: Inventory, threshold: float, leaf_only: bool
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return compare_roles(inventory, threshold, leaf_only)
 
 
-def proponer_familia(nombre_rol: str) -> tuple[str, str]:
-    nombre = normalizar_texto(nombre_rol)
-
-    coincidencias = [
-        familia
-        for familia, patron in REGLAS_FAMILIA
-        if re.search(patron, nombre)
-    ]
-
-    if not coincidencias:
-        return "POR_CLASIFICAR", "Baja"
-
-    if len(coincidencias) == 1:
-        return coincidencias[0], "Alta"
-
-    return coincidencias[0], "Media"
+@st.cache_data(max_entries=4, show_spinner=False)
+def cached_user_redundancy(
+    inventory: Inventory, leaf_only: bool
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return user_redundancy(inventory, leaf_only)
 
 
-def proponer_capacidades(nombre_rol: str) -> list[str]:
-    nombre = normalizar_texto(nombre_rol)
-
-    return [
-        capacidad
-        for capacidad, patron in REGLAS_CAPACIDAD
-        if re.search(patron, nombre)
-    ]
+def show_frame(frame: pd.DataFrame, empty_text: str, height: int = 350) -> None:
+    if frame.empty:
+        st.info(empty_text)
+    else:
+        st.dataframe(frame, use_container_width=True, hide_index=True, height=height)
 
 
-def crear_nombre_grupo_oci(nombre_rol: str) -> str:
-    nombre = normalizar_texto(nombre_rol)
-    return f"ERP_ROLE_{nombre[:85]}"
-
-
-def dataframe_csv(dataframe: pd.DataFrame) -> bytes:
-    return dataframe.to_csv(
-        index=False
-    ).encode("utf-8-sig")
-
-
-def crear_json_esquema_personalizado(
-    atributos: pd.DataFrame,
-) -> dict:
-    personalizados = atributos[
-        atributos["esquema"] == "Custom User"
-    ]
-
-    definiciones = []
-
-    for fila in personalizados.to_dict("records"):
-        definiciones.append(
-            {
-                "name": fila["destino_oci"],
-                "idcsDisplayName": fila["destino_oci"],
-                "description": fila["observacion"],
-                "required": bool(fila["obligatorio"]),
-                "type": "string",
-                "idcsMinLength": 1,
-                "idcsMaxLength": 255,
-                "idcsAuditable": True,
-                "returned": "default",
-                "mutability": "readWrite",
-                "idcsSearchable": True,
-                "multiValued": False,
-            }
-        )
-
-    return {
-        "_aviso": (
-            "BORRADOR. Revisar antes de aplicarlo en OCI."
-        ),
-        "_endpoint": (
-            f"/admin/v1/Schemas/{CUSTOM_USER_URN}"
-        ),
-        "schemas": [
-            "urn:ietf:params:scim:api:messages:2.0:PatchOp"
-        ],
-        "Operations": [
-            {
-                "op": "add",
-                "path": "attributes",
-                "value": definiciones,
-            }
-        ],
-    }
-
-
-def crear_json_claims(atributos: pd.DataFrame) -> list[dict]:
-    resultado = []
-
-    for fila in atributos.to_dict("records"):
-        claim = str(fila.get("claim_oidc", "") or "").strip()
-
-        if not claim:
-            continue
-
-        if "/" in claim:
-            continue
-
-        destino = fila["destino_oci"]
-
-        if fila["esquema"] == "Custom User":
-            expresion = (
-                f"$user.{CUSTOM_USER_URN}.{destino}"
-            )
-        elif destino == "externalId":
-            expresion = "$user.externalId"
-        else:
-            continue
-
-        resultado.append(
-            {
-                "_aviso": "BORRADOR. Revisar antes de aplicar.",
-                "schemas": [
-                    "urn:ietf:params:scim:schemas:"
-                    "oracle:idcs:CustomClaim"
-                ],
-                "name": claim,
-                "value": expresion,
-                "expression": True,
-                "mode": "always",
-                "tokenType": "BOTH",
-                "allScopes": True,
-            }
-        )
-
-    return resultado
-
-
-def crear_paquete_exportacion(
-    mapeo_roles: pd.DataFrame,
-    mapeo_funciones: pd.DataFrame,
-    mapeo_atributos: pd.DataFrame,
-    informe_calidad: dict,
+def make_export_zip(
+    inventory: Inventory,
+    role_candidates: pd.DataFrame,
+    identical: pd.DataFrame,
+    similar: pd.DataFrame,
+    subsets: pd.DataFrame,
+    covered_roles: pd.DataFrame,
+    repeated_grants: pd.DataFrame,
+    role_mapping: pd.DataFrame,
+    capability_mapping: pd.DataFrame,
 ) -> bytes:
-    memoria = io.BytesIO()
+    valid_role_privileges = inventory.role_privileges[
+        inventory.role_privileges["ID_PRIVILEGIO_REFERENCIADO"]
+        .astype(str)
+        .str.strip()
+        .ne("")
+    ]
+    summary = {
+        "fuente": inventory.source_name,
+        "usuarios": int(inventory.user_roles["ID_USUARIO_ERP"].nunique()),
+        "roles": int(inventory.role_catalog["ID_ROL_ASIGNADO"].nunique()),
+        "privilegios": int(
+            inventory.privilege_catalog["ID_PRIVILEGIO_REFERENCIADO"].nunique()
+        ),
+        "asignaciones_usuario_rol": int(
+            len(
+                inventory.user_roles[
+                    ["ID_USUARIO_ERP", "ID_ROL_ASIGNADO"]
+                ].drop_duplicates()
+            )
+        ),
+        "relaciones_rol_privilegio": int(
+            len(
+                valid_role_privileges[
+                    ["ID_ROL_ASIGNADO", "ID_PRIVILEGIO_REFERENCIADO"]
+                ].drop_duplicates()
+            )
+        ),
+        "avisos_integridad": int(len(inventory.anomalies)),
+        "nota": (
+            "Los resultados son candidatos de revisión. No autorizan fusiones ni bajas "
+            "automáticas y no configuran OCI."
+        ),
+    }
+    readme = """# Exportación de análisis ERP → OCI
 
-    with zipfile.ZipFile(
-        memoria,
-        mode="w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as archivo_zip:
-        archivo_zip.writestr(
-            "mapeo_roles_oci.csv",
-            dataframe_csv(mapeo_roles),
-        )
+Este ZIP contiene propuestas para revisión, no órdenes de cambio.
 
-        archivo_zip.writestr(
-            "mapeo_funciones_capacidades.csv",
-            dataframe_csv(mapeo_funciones),
-        )
+Orden recomendado:
+1. Corregir incidencias de integridad.
+2. Confirmar roles sin usuarios o sin privilegios.
+3. Validar con negocio los roles idénticos, similares y subconjuntos.
+4. Revisar redundancias por usuario.
+5. Aprobar el mapa 1:1 inicial de roles a grupos OCI.
+6. Mantener los privilegios concretos en el ERP; agruparlos en capacidades solo en una fase posterior.
 
-        archivo_zip.writestr(
-            "mapeo_atributos_scim.csv",
-            dataframe_csv(mapeo_atributos),
-        )
-
-        archivo_zip.writestr(
-            "oci_custom_schema_patch.json",
-            json.dumps(
-                crear_json_esquema_personalizado(
-                    mapeo_atributos
-                ),
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-
-        archivo_zip.writestr(
-            "oci_custom_claims.json",
-            json.dumps(
-                crear_json_claims(mapeo_atributos),
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-
-        archivo_zip.writestr(
-            "informe_calidad.json",
-            json.dumps(
-                informe_calidad,
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-
-        archivo_zip.writestr(
-            "LEEME.txt",
-            """
-MAPEO ERP → OCI IAM
-
-Los archivos de este paquete son borradores de diseño.
-
-No deben aplicarse directamente en producción.
-
-Modelo propuesto:
-
-1. externalId enlaza al usuario OCI con su identificador ERP.
-2. Los atributos organizativos se guardan en SCIM.
-3. Los roles ERP se representan inicialmente como grupos OCI.
-4. Las funciones ERP se clasifican en capacidades comprensibles.
-5. El ERP sigue controlando menús, operaciones y reglas de negocio.
-6. La migración debe hacerse de forma progresiva y reversible.
-
-Antes del piloto hacen falta:
-
-- Maestro completo de usuarios.
-- Catálogo descriptivo de funciones.
-- Validación de los propietarios funcionales.
-- Revisión de segregación de funciones.
-- Pruebas de equivalencia antes/después.
-            """.strip(),
-        )
-
-    return memoria.getvalue()
+Un privilegio concedido por varios roles no es necesariamente un error. Un nombre de prueba
+o un rol con pocos usuarios tampoco demuestra que esté obsoleto. Se necesitan owners,
+estado del usuario, trazas de uso y aprobación de negocio.
+"""
+    files = {
+        "resumen_inventario.json": json.dumps(summary, ensure_ascii=False, indent=2),
+        "roles_candidatos_revision.csv": role_candidates.to_csv(index=False),
+        "roles_identicos.csv": identical.to_csv(index=False),
+        "roles_similares.csv": similar.to_csv(index=False),
+        "roles_subconjunto.csv": subsets.to_csv(index=False),
+        "usuarios_roles_redundantes.csv": covered_roles.to_csv(index=False),
+        "usuarios_privilegios_repetidos.csv": repeated_grants.to_csv(index=False),
+        "mapeo_roles_oci.csv": role_mapping.to_csv(index=False),
+        "mapeo_privilegios_capacidades.csv": capability_mapping.to_csv(index=False),
+        "LEEME.md": readme,
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content.encode("utf-8-sig"))
+    return buffer.getvalue()
 
 
-# ============================================================
-# CARGA MANUAL DE LOS CSV
-# ============================================================
+st.title("Analizador ERP → OCI IAM")
+st.caption(
+    "Inventario, limpieza guiada y alternativas de mapeo. La app no escribe en el ERP ni en OCI."
+)
 
 with st.sidebar:
-    st.header("📁 Cargar inventarios")
-
-    st.caption(
-        "Los archivos se procesan en memoria durante la sesión."
-    )
-
-    archivo_usuarios_roles = st.file_uploader(
-        "DROLUSERpro.csv — usuario ↔ rol",
-        type=["csv"],
-        key="archivo_usuarios_roles",
-    )
-
-    archivo_roles_funciones = st.file_uploader(
-        "DROLFUNCpro.csv — rol ↔ función",
-        type=["csv"],
-        key="archivo_roles_funciones",
-    )
-
-    archivo_roles = st.file_uploader(
-        "DROLESpro.csv — catálogo de roles",
-        type=["csv"],
-        key="archivo_roles",
-    )
-
-    st.divider()
-
-    st.markdown(
-        """
-        **Lectura de resultados**
-
-        🟢 Observado: procede del ERP.
-
-        🟠 Inferido: sugerencia automática.
-
-        ⚪ Pendiente: necesita validación.
-        """
-    )
-
-    st.divider()
-
-    st.subheader("Documentación oficial")
-
-    for titulo, enlace in DOCUMENTACION_OCI.items():
-        st.markdown(f"[↗ {titulo}]({enlace})")
-
-
-archivos_completos = all(
-    [
-        archivo_usuarios_roles,
-        archivo_roles_funciones,
-        archivo_roles,
-    ]
-)
-
-if not archivos_completos:
-    st.info(
-        "Sube los tres CSV desde el panel lateral para comenzar."
-    )
-
-    st.markdown(
-        """
-        <div class="aviso">
-            <b>Privacidad:</b> esta aplicación no contiene copias de
-            los CSV. Los archivos sólo se leen cuando los seleccionas
-            desde la pantalla.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.stop()
-
-
-# ============================================================
-# LECTURA Y VALIDACIÓN
-# ============================================================
-
-try:
-    usuarios_roles = leer_csv_subido(
-        archivo_usuarios_roles
-    )
-
-    roles_funciones = leer_csv_subido(
-        archivo_roles_funciones
-    )
-
-    roles = leer_csv_subido(
-        archivo_roles
-    )
-
-    for dataframe in (
-        usuarios_roles,
-        roles_funciones,
-        roles,
-    ):
-        dataframe.columns = [
-            str(columna).strip().upper()
-            for columna in dataframe.columns
-        ]
-
-    validar_columnas(
-        usuarios_roles,
-        {
-            "ID_DUSUARIOS_FK",
-            "ID_DROLES_FK",
-        },
-        "DROLUSERpro.csv",
-    )
-
-    validar_columnas(
-        roles_funciones,
-        {
-            "ID_DROLES_FK",
-            "ID_DFUNCION_FK",
-        },
-        "DROLFUNCpro.csv",
-    )
-
-    validar_columnas(
-        roles,
-        {
-            "ID_DROLES",
-            "CODIGROL",
-        },
-        "DROLESpro.csv",
-    )
-
-except Exception as error:
-    st.error(f"No se pudieron leer los archivos: {error}")
-    st.stop()
-
-
-# Convertimos los identificadores a valores numéricos.
-
-usuarios_roles["ID_DUSUARIOS_FK"] = pd.to_numeric(
-    usuarios_roles["ID_DUSUARIOS_FK"],
-    errors="coerce",
-).astype("Int64")
-
-usuarios_roles["ID_DROLES_FK"] = pd.to_numeric(
-    usuarios_roles["ID_DROLES_FK"],
-    errors="coerce",
-).astype("Int64")
-
-roles_funciones["ID_DROLES_FK"] = pd.to_numeric(
-    roles_funciones["ID_DROLES_FK"],
-    errors="coerce",
-).astype("Int64")
-
-roles_funciones["ID_DFUNCION_FK"] = pd.to_numeric(
-    roles_funciones["ID_DFUNCION_FK"],
-    errors="coerce",
-).astype("Int64")
-
-roles["ID_DROLES"] = pd.to_numeric(
-    roles["ID_DROLES"],
-    errors="coerce",
-).astype("Int64")
-
-
-# ============================================================
-# CONSTRUCCIÓN DEL MODELO
-# ============================================================
-
-conteo_usuarios = usuarios_roles.groupby(
-    "ID_DROLES_FK"
-)["ID_DUSUARIOS_FK"].nunique()
-
-conteo_funciones = roles_funciones.groupby(
-    "ID_DROLES_FK"
-)["ID_DFUNCION_FK"].nunique()
-
-catalogo_roles = roles.copy()
-
-catalogo_roles["usuarios"] = (
-    catalogo_roles["ID_DROLES"]
-    .map(conteo_usuarios)
-    .fillna(0)
-    .astype(int)
-)
-
-catalogo_roles["funciones"] = (
-    catalogo_roles["ID_DROLES"]
-    .map(conteo_funciones)
-    .fillna(0)
-    .astype(int)
-)
-
-propuestas_familia = catalogo_roles[
-    "CODIGROL"
-].apply(proponer_familia)
-
-catalogo_roles["familia_propuesta"] = (
-    propuestas_familia.str[0]
-)
-
-catalogo_roles["confianza"] = (
-    propuestas_familia.str[1]
-)
-
-catalogo_roles["capacidades_por_nombre"] = (
-    catalogo_roles["CODIGROL"].apply(
-        lambda valor: ", ".join(
-            proponer_capacidades(valor)
-        )
-    )
-)
-
-catalogo_roles["grupo_oci_propuesto"] = (
-    catalogo_roles["CODIGROL"].apply(
-        crear_nombre_grupo_oci
-    )
-)
-
-catalogo_roles["estado_decision"] = "Pendiente"
-catalogo_roles["observacion"] = ""
-
-
-# Funciones asociadas a cada rol.
-
-funciones_por_rol = {
-    int(id_rol): set(
-        grupo["ID_DFUNCION_FK"]
-        .dropna()
-        .astype(int)
-    )
-    for id_rol, grupo in roles_funciones.groupby(
-        "ID_DROLES_FK"
-    )
-}
-
-
-# ============================================================
-# INFORME DE CALIDAD
-# ============================================================
-
-informe_calidad = {
-    "usuarios_unicos": int(
-        usuarios_roles["ID_DUSUARIOS_FK"].nunique()
-    ),
-    "roles_catalogo": int(
-        roles["ID_DROLES"].nunique()
-    ),
-    "roles_asignados": int(
-        usuarios_roles["ID_DROLES_FK"].nunique()
-    ),
-    "funciones_unicas": int(
-        roles_funciones["ID_DFUNCION_FK"].nunique()
-    ),
-    "asignaciones_usuario_rol": int(
-        len(usuarios_roles)
-    ),
-    "asignaciones_rol_funcion": int(
-        len(roles_funciones)
-    ),
-    "roles_sin_usuarios": int(
-        (
-            ~roles["ID_DROLES"].isin(
-                usuarios_roles["ID_DROLES_FK"]
-            )
-        ).sum()
-    ),
-    "roles_sin_funciones": int(
-        (
-            ~roles["ID_DROLES"].isin(
-                roles_funciones["ID_DROLES_FK"]
-            )
-        ).sum()
-    ),
-    "asignaciones_con_rol_desconocido": int(
-        (
-            ~usuarios_roles["ID_DROLES_FK"].isin(
-                roles["ID_DROLES"]
-            )
-        ).sum()
-    ),
-    "duplicados_usuario_rol": int(
-        usuarios_roles.duplicated(
-            [
-                "ID_DUSUARIOS_FK",
-                "ID_DROLES_FK",
-            ]
-        ).sum()
-    ),
-    "duplicados_rol_funcion": int(
-        roles_funciones.duplicated(
-            [
-                "ID_DROLES_FK",
-                "ID_DFUNCION_FK",
-            ]
-        ).sum()
-    ),
-}
-
-
-# ============================================================
-# ESTADO EDITABLE DE STREAMLIT
-# ============================================================
-
-if "mapeo_roles" not in st.session_state:
-    st.session_state.mapeo_roles = catalogo_roles[
+    st.header("1. Cargar inventario")
+    mode = st.radio(
+        "Formato de entrada",
         [
-            "ID_DROLES",
-            "CODIGROL",
-            "usuarios",
-            "funciones",
-            "familia_propuesta",
-            "confianza",
-            "capacidades_por_nombre",
-            "grupo_oci_propuesto",
-            "estado_decision",
-            "observacion",
-        ]
-    ].copy()
-
-
-if "mapeo_funciones" not in st.session_state:
-    ids_funciones = sorted(
-        roles_funciones[
-            "ID_DFUNCION_FK"
-        ]
-        .dropna()
-        .astype(int)
-        .unique()
+            "CSV consolidado de usuarios, roles y privilegios",
+            "Tres CSV originales",
+        ],
+    )
+    st.warning(
+        "Privacidad: si publicas la app en Streamlit Community Cloud, los archivos se "
+        "procesarán en ese servidor. Para datos reales usa alojamiento privado/interno "
+        "o archivos anonimizados."
     )
 
-    st.session_state.mapeo_funciones = pd.DataFrame(
-        {
-            "ID_DFUNCION": ids_funciones,
-            "codigo_funcion": "",
-            "descripcion_funcion": "",
-            "capacidad_objetivo": "SIN_CLASIFICAR",
-            "criticidad": "Por revisar",
-            "propietario_funcional": "",
-            "observacion": "",
-        }
+inventory: Inventory | None = None
+if mode == "CSV consolidado de usuarios, roles y privilegios":
+    with st.sidebar:
+        consolidated_file = st.file_uploader(
+            "Sube el inventario consolidado",
+            type=["csv"],
+            help=(
+                "Espera las columnas ENTORNO, FECHA_EXTRACCION, ID_USUARIO_ERP, "
+                "CODIGO_ROL, CODIGO_PRIVILEGIO, DESCRIPCION_PRIVILEGIO, etc."
+            ),
+        )
+    if consolidated_file is not None:
+        try:
+            with st.spinner("Leyendo y normalizando el inventario…"):
+                inventory = cached_consolidated(
+                    consolidated_file.getvalue(), consolidated_file.name
+                )
+        except Exception as exc:
+            st.error(f"No se pudo interpretar el CSV consolidado: {exc}")
+            st.stop()
+else:
+    with st.sidebar:
+        droluser_file = st.file_uploader("DROLUSER", type=["csv"])
+        drolfunc_file = st.file_uploader("DROLFUNC", type=["csv"])
+        droles_file = st.file_uploader("DROLES", type=["csv"])
+        dfuncion_file = st.file_uploader(
+            "DFUNCION (opcional, recomendado)",
+            type=["csv"],
+            help="Añade código y descripción de los privilegios.",
+        )
+    if droluser_file and drolfunc_file and droles_file:
+        try:
+            with st.spinner("Uniendo los catálogos…"):
+                inventory = cached_legacy(
+                    droluser_file.getvalue(),
+                    drolfunc_file.getvalue(),
+                    droles_file.getvalue(),
+                    dfuncion_file.getvalue() if dfuncion_file else None,
+                )
+        except Exception as exc:
+            st.error(f"No se pudieron interpretar los CSV: {exc}")
+            st.stop()
+
+if inventory is None:
+    st.info(
+        "Sube el CSV consolidado de PRO, o cambia al formato de tres CSV. "
+        "Los archivos solo se leen cuando los seleccionas."
+    )
+    st.markdown(
+        """
+### Qué podrá detectar
+
+- Incidencias de integridad y roles sin usuarios o sin privilegios.
+- Roles con conjuntos idénticos, muy parecidos o contenidos en otros.
+- Usuarios con roles potencialmente cubiertos por otros roles.
+- Privilegios que llegan al mismo usuario a través de varios roles.
+- Un mapa inicial de cada rol ERP a un grupo OCI y una propuesta posterior por capacidades.
+
+Los resultados son **candidatos a revisión**, no cambios automáticos.
+"""
+    )
+    st.stop()
+
+environments = sorted(
+    value
+    for value in inventory.user_roles.get("ENTORNO", pd.Series(dtype=str)).unique()
+    if value
+)
+dates = sorted(
+    value
+    for value in inventory.user_roles.get("FECHA_EXTRACCION", pd.Series(dtype=str)).unique()
+    if value
+)
+with st.sidebar:
+    st.header("2. Seleccionar foto")
+    selected_environment = (
+        st.selectbox("Entorno", environments) if environments else ""
+    )
+    selected_date = st.selectbox("Fecha de extracción", dates) if dates else ""
+    leaf_only = st.toggle(
+        "Comparar solo operaciones finales (IT)",
+        value=True,
+        help="Evita que las raíces y grupos estructurales inflen la similitud.",
+    )
+    similarity_threshold = st.slider(
+        "Umbral de similitud", 0.50, 1.00, 0.85, 0.01
+    )
+    low_use_limit = st.number_input(
+        "Pocos usuarios: hasta", min_value=0, max_value=100, value=1
     )
 
-
-if "mapeo_atributos" not in st.session_state:
-    st.session_state.mapeo_atributos = pd.DataFrame(
-        ATRIBUTOS_PROPUESTOS
+snapshot = filter_snapshot(inventory, selected_environment, selected_date)
+if len(dates) <= 1:
+    st.info(
+        "El archivo contiene una sola fecha de extracción: es una foto consolidada. "
+        "Para analizar altas, bajas y evolución hacen falta varias extracciones."
     )
 
+summary = role_summary(snapshot)
+identical, similar, subsets = cached_comparisons(
+    snapshot, similarity_threshold, leaf_only
+)
+covered_roles, repeated_grants = cached_user_redundancy(snapshot, leaf_only)
+duplicate_definitions = duplicate_privilege_definitions(snapshot)
+role_mapping_default = build_role_mapping(snapshot, identical, int(low_use_limit))
+capability_mapping_default = build_capability_mapping(snapshot)
 
-# ============================================================
-# PESTAÑAS PRINCIPALES
-# ============================================================
+user_role_pairs = snapshot.user_roles[
+    ["ID_USUARIO_ERP", "ID_ROL_ASIGNADO"]
+].drop_duplicates()
+role_privilege_pairs = snapshot.role_privileges[
+    snapshot.role_privileges["ID_PRIVILEGIO_REFERENCIADO"].astype(str).str.strip().ne("")
+][["ID_ROL_ASIGNADO", "ID_PRIVILEGIO_REFERENCIADO"]].drop_duplicates()
+users = int(snapshot.user_roles["ID_USUARIO_ERP"].nunique())
+roles = int(snapshot.role_catalog["ID_ROL_ASIGNADO"].nunique())
+privileges = int(
+    snapshot.privilege_catalog.loc[
+        snapshot.privilege_catalog["ID_PRIVILEGIO_REFERENCIADO"]
+        .astype(str)
+        .str.strip()
+        .ne(""),
+        "ID_PRIVILEGIO_REFERENCIADO",
+    ].nunique()
+)
 
-(
-    tab_resumen,
-    tab_roles,
-    tab_comparacion,
-    tab_mapeo,
-    tab_oci,
-    tab_token,
-    tab_exportar,
-) = st.tabs(
+tab_overview, tab_cleanup, tab_roles, tab_users, tab_oci, tab_export = st.tabs(
     [
-        "Resumen",
-        "Explorar roles",
-        "Comparar variantes",
-        "Taller de mapeo",
-        "Diseño OCI",
-        "Simular token",
+        "Radiografía",
+        "Limpieza ERP",
+        "Roles repetidos",
+        "Usuarios y redundancias",
+        "Mapa OCI",
         "Exportar",
     ]
 )
 
-
-# ============================================================
-# RESUMEN
-# ============================================================
-
-with tab_resumen:
-    columnas = st.columns(5)
-
-    columnas[0].metric(
-        "Usuarios",
-        informe_calidad["usuarios_unicos"],
+with tab_overview:
+    cols = st.columns(5)
+    cols[0].metric("Usuarios", f"{users:,}".replace(",", "."))
+    cols[1].metric("Roles", f"{roles:,}".replace(",", "."))
+    cols[2].metric("Privilegios", f"{privileges:,}".replace(",", "."))
+    cols[3].metric("Usuario ↔ rol", f"{len(user_role_pairs):,}".replace(",", "."))
+    cols[4].metric(
+        "Rol ↔ privilegio", f"{len(role_privilege_pairs):,}".replace(",", ".")
     )
-
-    columnas[1].metric(
-        "Roles",
-        informe_calidad["roles_catalogo"],
-    )
-
-    columnas[2].metric(
-        "Roles asignados",
-        informe_calidad["roles_asignados"],
-    )
-
-    columnas[3].metric(
-        "Funciones",
-        informe_calidad["funciones_unicas"],
-    )
-
-    columnas[4].metric(
-        "Asignaciones",
-        informe_calidad["asignaciones_usuario_rol"],
-    )
-
     st.markdown(
         """
-        <div class="aviso aviso-amarillo">
-            <b>Límite actual:</b> los archivos contienen las relaciones
-            usuario–rol y rol–función, pero no contienen el maestro
-            completo de usuarios ni la descripción de las funciones.
-            La aplicación no inventa esos datos.
-        </div>
-        """,
-        unsafe_allow_html=True,
+```text
+USUARIO ──< DROLUSER >── ROL ──< DROLFUNC >── DFUNCION / PRIVILEGIO
+ muchos usuarios por rol       muchos privilegios por rol
+```
+El acceso efectivo de un usuario se aproxima a la **unión** de los privilegios de sus
+roles. Conviene confirmar con IT si existen permisos directos, denegaciones o herencia
+fuera de estas tablas.
+"""
     )
-
-    izquierda, derecha = st.columns(2)
-
-    with izquierda:
-        st.subheader("Roles con más usuarios")
-
-        roles_principales = (
-            catalogo_roles
-            .nlargest(15, "usuarios")
-            .sort_values("usuarios")
-        )
-
-        grafico = px.bar(
-            roles_principales,
-            x="usuarios",
-            y="CODIGROL",
+    left, right = st.columns(2)
+    with left:
+        top_roles = summary.head(20)
+        figure = px.bar(
+            top_roles.sort_values("USUARIOS"),
+            x="USUARIOS",
+            y="CODIGO_ROL",
             orientation="h",
-            color="funciones",
-            color_continuous_scale="Tealgrn",
-            labels={
-                "usuarios": "Usuarios",
-                "CODIGROL": "",
-                "funciones": "Funciones",
-            },
+            title="20 roles con más usuarios",
         )
-
-        grafico.update_layout(height=520)
-
-        st.plotly_chart(
-            grafico,
-            use_container_width=True,
+        st.plotly_chart(figure, use_container_width=True)
+    with right:
+        type_counts = (
+            snapshot.role_privileges["TIPO_PRIVILEGIO"]
+            .replace("", "SIN CLASIFICAR")
+            .value_counts()
+            .rename_axis("TIPO")
+            .reset_index(name="RELACIONES")
         )
-
-    with derecha:
-        st.subheader("Usuarios frente a funciones")
-
-        dispersion = px.scatter(
-            catalogo_roles,
-            x="usuarios",
-            y="funciones",
-            color="familia_propuesta",
-            hover_name="CODIGROL",
-            size="usuarios",
-            size_max=40,
-            labels={
-                "usuarios": "Usuarios",
-                "funciones": "Funciones",
-            },
+        figure = px.pie(
+            type_counts,
+            names="TIPO",
+            values="RELACIONES",
+            hole=0.45,
+            title="Relaciones por tipo de privilegio",
         )
+        st.plotly_chart(figure, use_container_width=True)
+    st.subheader("Inventario por rol")
+    show_frame(summary, "No hay roles en la foto seleccionada.", 420)
 
-        dispersion.update_layout(height=410)
-
-        st.plotly_chart(
-            dispersion,
-            use_container_width=True,
-        )
-
-        st.subheader("Calidad de los datos")
-
-        tabla_calidad = pd.DataFrame(
+with tab_cleanup:
+    st.subheader("Orden de limpieza recomendado dentro del ERP")
+    st.markdown(
+        """
+1. Corregir referencias rotas y roles inexistentes.
+2. Confirmar roles sin usuarios o sin privilegios.
+3. Revisar funciones duplicadas reales.
+4. Validar roles con privilegios idénticos, similares o contenidos en otros.
+5. Revisar redundancias usuario a usuario antes de retirar asignaciones.
+6. Aplicar cambios gradualmente, con owner, aprobación, prueba y reversión.
+"""
+    )
+    st.warning(
+        "Un rol con pocos usuarios o nombre de prueba no está demostrado como obsoleto. "
+        "Para decidirlo faltan estado del usuario, fecha de último uso, owner y trazas."
+    )
+    st.subheader("Incidencias de integridad")
+    show_frame(
+        snapshot.anomalies,
+        "No se han encontrado incidencias de integridad en esta foto.",
+    )
+    role_candidates = summary[
+        (summary["USUARIOS"] <= int(low_use_limit))
+        | (summary["PRIVILEGIOS"] == 0)
+        | (summary["AVISOS_INTEGRIDAD"] > 0)
+        | summary["NOMBRE_A_REVISAR"]
+    ].copy()
+    st.subheader("Roles candidatos a revisar")
+    show_frame(
+        role_candidates,
+        "No hay candidatos con los criterios actuales.",
+    )
+    st.subheader("Definiciones de privilegio realmente duplicadas")
+    st.caption(
+        "Mismo código y descripción asociados a varios identificadores. No confundir "
+        "con un privilegio utilizado por muchos roles."
+    )
+    show_frame(
+        duplicate_definitions,
+        "No se han detectado definiciones duplicadas con este criterio.",
+    )
+    transversal = (
+        snapshot.role_privileges[
+            snapshot.role_privileges["ID_PRIVILEGIO_REFERENCIADO"]
+            .astype(str)
+            .str.strip()
+            .ne("")
+        ].groupby(
             [
-                {
-                    "control": "Roles sin usuarios",
-                    "resultado":
-                        informe_calidad["roles_sin_usuarios"],
-                },
-                {
-                    "control": "Roles sin funciones",
-                    "resultado":
-                        informe_calidad["roles_sin_funciones"],
-                },
-                {
-                    "control": "Asignaciones a rol desconocido",
-                    "resultado":
-                        informe_calidad[
-                            "asignaciones_con_rol_desconocido"
-                        ],
-                },
-                {
-                    "control": "Duplicados usuario–rol",
-                    "resultado":
-                        informe_calidad[
-                            "duplicados_usuario_rol"
-                        ],
-                },
-                {
-                    "control": "Duplicados rol–función",
-                    "resultado":
-                        informe_calidad[
-                            "duplicados_rol_funcion"
-                        ],
-                },
-            ]
-        )
-
-        st.dataframe(
-            tabla_calidad,
-            hide_index=True,
-            use_container_width=True,
-        )
-
-
-# ============================================================
-# EXPLORACIÓN DE ROLES
-# ============================================================
+                "ID_PRIVILEGIO_REFERENCIADO",
+                "CODIGO_PRIVILEGIO",
+                "DESCRIPCION_PRIVILEGIO",
+            ],
+            dropna=False,
+        )["ID_ROL_ASIGNADO"]
+        .nunique()
+        .rename("NUM_ROLES")
+        .reset_index()
+        .sort_values("NUM_ROLES", ascending=False)
+    )
+    st.subheader("Privilegios más transversales")
+    st.caption("Que aparezcan en varios roles es normal; sirve para localizar alto impacto.")
+    show_frame(transversal.head(50), "No hay información de privilegios.")
 
 with tab_roles:
-    st.subheader("Ficha de un rol")
-
-    nombres_roles = (
-        catalogo_roles["CODIGROL"]
-        .astype(str)
-        .sort_values()
-        .tolist()
+    st.subheader("Roles con el mismo contenido")
+    show_frame(
+        identical,
+        "No hay pares con conjuntos de privilegios idénticos.",
     )
-
-    nombre_rol_seleccionado = st.selectbox(
-        "Selecciona un rol",
-        nombres_roles,
+    st.subheader(f"Roles con similitud ≥ {similarity_threshold:.0%}")
+    show_frame(
+        similar,
+        "No hay pares no idénticos que superen el umbral.",
     )
-
-    fila_rol = catalogo_roles[
-        catalogo_roles["CODIGROL"].astype(str)
-        == nombre_rol_seleccionado
-    ].iloc[0]
-
-    id_rol_seleccionado = int(
-        fila_rol["ID_DROLES"]
+    st.subheader("Roles cuyo contenido está incluido en otro")
+    show_frame(
+        subsets,
+        "No hay relaciones de subconjunto.",
     )
-
-    columnas = st.columns(4)
-
-    columnas[0].metric(
-        "ID del rol",
-        id_rol_seleccionado,
+    st.divider()
+    st.subheader("Comparador de dos roles")
+    role_options = (
+        snapshot.role_catalog.sort_values("CODIGO_ROL")
+        .assign(
+            LABEL=lambda frame: frame["CODIGO_ROL"]
+            + " ["
+            + frame["ID_ROL_ASIGNADO"].astype(str)
+            + "]"
+        )
+        .drop_duplicates("ID_ROL_ASIGNADO")
     )
-
-    columnas[1].metric(
-        "Usuarios",
-        int(fila_rol["usuarios"]),
-    )
-
-    columnas[2].metric(
-        "Funciones",
-        int(fila_rol["funciones"]),
-    )
-
-    columnas[3].metric(
-        "Familia sugerida",
-        fila_rol["familia_propuesta"],
-    )
-
-    izquierda, derecha = st.columns(2)
-
-    with izquierda:
-        st.markdown("#### Usuarios asignados")
-
-        usuarios_del_rol = (
-            usuarios_roles[
-                usuarios_roles["ID_DROLES_FK"]
-                == id_rol_seleccionado
-            ][["ID_DUSUARIOS_FK"]]
-            .drop_duplicates()
-            .sort_values("ID_DUSUARIOS_FK")
+    if len(role_options) >= 2:
+        option_map = dict(
+            zip(role_options["LABEL"], role_options["ID_ROL_ASIGNADO"])
+        )
+        col_a, col_b = st.columns(2)
+        labels = list(option_map)
+        label_a = col_a.selectbox("Rol A", labels, index=0)
+        label_b = col_b.selectbox("Rol B", labels, index=min(1, len(labels) - 1))
+        sets = privilege_sets(snapshot, leaf_only)
+        set_a = sets.get(option_map[label_a], set())
+        set_b = sets.get(option_map[label_b], set())
+        privilege_lookup = (
+            snapshot.privilege_catalog.drop_duplicates("ID_PRIVILEGIO_REFERENCIADO")
+            .set_index("ID_PRIVILEGIO_REFERENCIADO")[
+                ["CODIGO_PRIVILEGIO", "DESCRIPCION_PRIVILEGIO"]
+            ]
         )
 
-        st.dataframe(
-            usuarios_del_rol,
-            hide_index=True,
-            use_container_width=True,
-            height=400,
-        )
-
-    with derecha:
-        st.markdown("#### Funciones asignadas")
-
-        funciones_del_rol = (
-            roles_funciones[
-                roles_funciones["ID_DROLES_FK"]
-                == id_rol_seleccionado
-            ][["ID_DFUNCION_FK"]]
-            .drop_duplicates()
-        )
-
-        funciones_descritas = funciones_del_rol.merge(
-            st.session_state.mapeo_funciones,
-            left_on="ID_DFUNCION_FK",
-            right_on="ID_DFUNCION",
-            how="left",
-        )
-
-        st.dataframe(
-            funciones_descritas[
-                [
-                    "ID_DFUNCION_FK",
-                    "codigo_funcion",
-                    "descripcion_funcion",
-                    "capacidad_objetivo",
-                ]
-            ],
-            hide_index=True,
-            use_container_width=True,
-            height=400,
-        )
-
-    capacidades_sugeridas = (
-        fila_rol["capacidades_por_nombre"]
-        or "No se pudo sugerir ninguna"
-    )
-
-    st.info(
-        "Capacidades sugeridas por el nombre del rol: "
-        f"{capacidades_sugeridas}. "
-        "Esta sugerencia requiere validación funcional."
-    )
-
-
-# ============================================================
-# COMPARACIÓN
-# ============================================================
-
-with tab_comparacion:
-    st.subheader("Comparar dos perfiles")
-
-    columna_a, columna_b = st.columns(2)
-
-    nombre_rol_a = columna_a.selectbox(
-        "Rol A",
-        nombres_roles,
-        key="comparador_rol_a",
-    )
-
-    indice_b = (
-        1 if len(nombres_roles) > 1 else 0
-    )
-
-    nombre_rol_b = columna_b.selectbox(
-        "Rol B",
-        nombres_roles,
-        index=indice_b,
-        key="comparador_rol_b",
-    )
-
-    tabla_ids_roles = catalogo_roles.set_index(
-        "CODIGROL"
-    )["ID_DROLES"].to_dict()
-
-    id_rol_a = int(
-        tabla_ids_roles[nombre_rol_a]
-    )
-
-    id_rol_b = int(
-        tabla_ids_roles[nombre_rol_b]
-    )
-
-    funciones_a = funciones_por_rol.get(
-        id_rol_a,
-        set(),
-    )
-
-    funciones_b = funciones_por_rol.get(
-        id_rol_b,
-        set(),
-    )
-
-    funciones_comunes = funciones_a & funciones_b
-    solo_a = funciones_a - funciones_b
-    solo_b = funciones_b - funciones_a
-    union = funciones_a | funciones_b
-
-    similitud = (
-        len(funciones_comunes) / len(union)
-        if union
-        else 1.0
-    )
-
-    columnas = st.columns(4)
-
-    columnas[0].metric(
-        "Similitud Jaccard",
-        f"{similitud:.1%}",
-    )
-
-    columnas[1].metric(
-        "Funciones comunes",
-        len(funciones_comunes),
-    )
-
-    columnas[2].metric(
-        "Sólo en el rol A",
-        len(solo_a),
-    )
-
-    columnas[3].metric(
-        "Sólo en el rol B",
-        len(solo_b),
-    )
-
-    diferencias = pd.DataFrame(
-        [
-            {
-                "ID_DFUNCION": funcion,
-                "presencia": f"Sólo {nombre_rol_a}",
-            }
-            for funcion in sorted(solo_a)
-        ]
-        + [
-            {
-                "ID_DFUNCION": funcion,
-                "presencia": f"Sólo {nombre_rol_b}",
-            }
-            for funcion in sorted(solo_b)
-        ]
-        + [
-            {
-                "ID_DFUNCION": funcion,
-                "presencia": "Común",
-            }
-            for funcion in sorted(funciones_comunes)
-        ]
-    )
-
-    diferencias = diferencias.merge(
-        st.session_state.mapeo_funciones,
-        on="ID_DFUNCION",
-        how="left",
-    )
-
-    opciones_presencia = (
-        diferencias["presencia"]
-        .drop_duplicates()
-        .tolist()
-    )
-
-    seleccion_presencia = st.multiselect(
-        "Elementos que se mostrarán",
-        opciones_presencia,
-        default=[
-            opcion
-            for opcion in opciones_presencia
-            if opcion != "Común"
-        ],
-    )
-
-    st.dataframe(
-        diferencias[
-            diferencias["presencia"].isin(
-                seleccion_presencia
+        def detail(ids: set[str]) -> pd.DataFrame:
+            if not ids:
+                return pd.DataFrame(columns=["ID_PRIVILEGIO", "CODIGO", "DESCRIPCION"])
+            rows = privilege_lookup.reindex(sorted(ids)).reset_index()
+            return rows.rename(
+                columns={
+                    "ID_PRIVILEGIO_REFERENCIADO": "ID_PRIVILEGIO",
+                    "CODIGO_PRIVILEGIO": "CODIGO",
+                    "DESCRIPCION_PRIVILEGIO": "DESCRIPCION",
+                }
             )
+
+        common, only_a, only_b = st.tabs(
+            [
+                f"Comunes ({len(set_a & set_b)})",
+                f"Solo A ({len(set_a - set_b)})",
+                f"Solo B ({len(set_b - set_a)})",
+            ]
+        )
+        with common:
+            show_frame(detail(set_a & set_b), "No tienen privilegios comunes.")
+        with only_a:
+            show_frame(detail(set_a - set_b), "A no aporta privilegios exclusivos.")
+        with only_b:
+            show_frame(detail(set_b - set_a), "B no aporta privilegios exclusivos.")
+
+with tab_users:
+    cols = st.columns(3)
+    cols[0].metric(
+        "Usuarios con rol cubierto",
+        (
+            covered_roles["ID_USUARIO_ERP"].nunique()
+            if not covered_roles.empty
+            else 0
+        ),
+    )
+    cols[1].metric(
+        "Usuarios con concesión repetida",
+        (
+            repeated_grants["ID_USUARIO_ERP"].nunique()
+            if not repeated_grants.empty
+            else 0
+        ),
+    )
+    cols[2].metric(
+        "Concesiones extra",
+        (
+            int(repeated_grants["CONCESIONES_EXTRA"].sum())
+            if not repeated_grants.empty
+            else 0
+        ),
+    )
+    st.caption(
+        "“Cubierto” significa que, para esta foto y este alcance, los privilegios de un "
+        "rol también llegan por otro. No demuestra que retirar el rol sea seguro."
+    )
+    st.subheader("Roles potencialmente redundantes por usuario")
+    show_frame(
+        covered_roles,
+        "No se han detectado roles cubiertos por otros para un mismo usuario.",
+        420,
+    )
+    st.subheader("Privilegios concedidos por varios roles al mismo usuario")
+    if repeated_grants.empty:
+        st.info("No se han detectado concesiones repetidas.")
+    else:
+        repeated_by_user = (
+            repeated_grants.groupby("ID_USUARIO_ERP")
+            .agg(
+                PRIVILEGIOS_REPETIDOS=("ID_PRIVILEGIO", "nunique"),
+                CONCESIONES_EXTRA=("CONCESIONES_EXTRA", "sum"),
+            )
+            .reset_index()
+            .sort_values("CONCESIONES_EXTRA", ascending=False)
+        )
+        st.dataframe(
+            repeated_by_user.head(100),
+            use_container_width=True,
+            hide_index=True,
+            height=360,
+        )
+        st.caption(
+            "Se muestran los 100 usuarios con más solapamiento. El detalle completo "
+            "se incluye en la exportación."
+        )
+    all_users = sorted(snapshot.user_roles["ID_USUARIO_ERP"].dropna().unique(), key=str)
+    if all_users:
+        selected_user = st.selectbox("Ver detalle de un usuario", all_users)
+        user_assignments = snapshot.user_roles[
+            snapshot.user_roles["ID_USUARIO_ERP"] == selected_user
         ][
             [
-                "ID_DFUNCION",
-                "presencia",
-                "descripcion_funcion",
-                "capacidad_objetivo",
+                "ID_ROL_ASIGNADO",
+                "CODIGO_ROL",
+                "DESCRIPCION_ROL",
+                "FECHA_ASIGNACION_ROL",
             ]
-        ],
-        hide_index=True,
-        use_container_width=True,
-        height=430,
-    )
-
-    st.warning(
-        "Una similitud alta no significa que los roles puedan "
-        "fusionarse. Las diferencias deben explicarse y aprobarse."
-    )
-
-
-# ============================================================
-# TALLER DE MAPEO
-# ============================================================
-
-with tab_mapeo:
-    st.subheader(
-        "1. Rol ERP → familia y grupo OCI"
-    )
-
-    st.session_state.mapeo_roles = st.data_editor(
-        st.session_state.mapeo_roles,
-        hide_index=True,
-        use_container_width=True,
-        height=430,
-        disabled=[
-            "ID_DROLES",
-            "CODIGROL",
-            "usuarios",
-            "funciones",
-            "confianza",
-            "capacidades_por_nombre",
-        ],
-        column_config={
-            "familia_propuesta":
-                st.column_config.SelectboxColumn(
-                    "familia_objetivo",
-                    options=FAMILIAS_DISPONIBLES,
-                ),
-
-            "estado_decision":
-                st.column_config.SelectboxColumn(
-                    "estado_decision",
-                    options=[
-                        "Pendiente",
-                        "Validado",
-                        "Excepción",
-                        "Descartar",
-                    ],
-                ),
-        },
-        key="editor_roles",
-    )
-
-    st.subheader(
-        "2. Función ERP → capacidad"
-    )
-
-    st.markdown(
-        """
-        <div class="aviso aviso-amarillo">
-            Los CSV sólo contienen identificadores de función.
-            Introduce el código y la descripción del catálogo
-            funcional antes de tomar decisiones definitivas.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.session_state.mapeo_funciones = st.data_editor(
-        st.session_state.mapeo_funciones,
-        hide_index=True,
-        use_container_width=True,
-        height=440,
-        disabled=["ID_DFUNCION"],
-        column_config={
-            "capacidad_objetivo":
-                st.column_config.SelectboxColumn(
-                    "capacidad_objetivo",
-                    options=CAPACIDADES_DISPONIBLES,
-                ),
-
-            "criticidad":
-                st.column_config.SelectboxColumn(
-                    "criticidad",
-                    options=[
-                        "Por revisar",
-                        "Baja",
-                        "Media",
-                        "Alta",
-                        "Segregación",
-                    ],
-                ),
-        },
-        key="editor_funciones",
-    )
-
-    porcentaje_clasificado = (
-        st.session_state.mapeo_funciones[
-            "capacidad_objetivo"
-        ]
-        .ne("SIN_CLASIFICAR")
-        .mean()
-    )
-
-    st.progress(
-        float(porcentaje_clasificado),
-        text=(
-            "Funciones clasificadas: "
-            f"{porcentaje_clasificado:.1%}"
-        ),
-    )
-
-    st.subheader(
-        "3. Atributos ERP → SCIM y OIDC"
-    )
-
-    st.session_state.mapeo_atributos = st.data_editor(
-        st.session_state.mapeo_atributos,
-        hide_index=True,
-        use_container_width=True,
-        height=430,
-        column_config={
-            "obligatorio":
-                st.column_config.CheckboxColumn(
-                    "obligatorio"
-                ),
-
-            "estado":
-                st.column_config.SelectboxColumn(
-                    "estado",
-                    options=[
-                        "Propuesto",
-                        "Validado",
-                        "Pendiente de fichero",
-                        "Descartar",
-                    ],
-                ),
-        },
-        key="editor_atributos",
-    )
-
-
-# ============================================================
-# DISEÑO OCI
-# ============================================================
+        ].drop_duplicates()
+        show_frame(user_assignments, "El usuario no tiene roles.")
+        if not covered_roles.empty:
+            st.markdown("**Roles cubiertos para este usuario**")
+            show_frame(
+                covered_roles[covered_roles["ID_USUARIO_ERP"] == selected_user],
+                "No se detectan roles cubiertos para este usuario.",
+                260,
+            )
+        if not repeated_grants.empty:
+            st.markdown("**Concesiones repetidas para este usuario**")
+            show_frame(
+                repeated_grants[repeated_grants["ID_USUARIO_ERP"] == selected_user],
+                "No se detectan concesiones repetidas para este usuario.",
+                300,
+            )
 
 with tab_oci:
-    st.subheader(
-        "Arquitectura propuesta"
+    st.subheader("Alternativas de mapeo")
+    option = st.radio(
+        "Modelo",
+        [
+            "Híbrido (recomendado)",
+            "1 grupo OCI por rol ERP",
+            "Grupos OCI por capacidad de negocio",
+        ],
+        horizontal=True,
     )
-
+    if option == "Híbrido (recomendado)":
+        st.success(
+            "Fase 1: OCI autentica y entrega grupos equivalentes a los roles ERP. "
+            "El ERP conserva DROLFUNC/DFUNCION y decide las operaciones concretas. "
+            "Fase 2: solo tras limpiar y aprobar, agrupar privilegios finales en capacidades."
+        )
+    elif option == "1 grupo OCI por rol ERP":
+        st.info(
+            "Es el camino más trazable para empezar, aunque reproduce parte de la "
+            "complejidad actual. Evita crear un grupo OCI por cada privilegio técnico."
+        )
+    else:
+        st.warning(
+            "Es el modelo objetivo más limpio, pero requiere owner, semántica confirmada, "
+            "matriz SoD, pruebas y aprobación de negocio. No debe deducirse solo por nombres."
+        )
     st.markdown(
         """
-        <div class="aviso">
-            <b>Asignación:</b> grupos OCI ERP_ROLE_* para reproducir
-            inicialmente los perfiles actuales.<br><br>
-
-            <b>Atributos:</b> SCIM core o Enterprise cuando exista
-            un atributo estándar; Custom User únicamente cuando sea
-            necesario.<br><br>
-
-            <b>Entrega al ERP:</b> token OIDC y, si es necesario,
-            consulta al endpoint userinfo.<br><br>
-
-            <b>Decisión final:</b> el ERP conserva la traducción a
-            funciones, menús, operaciones y reglas de negocio.
-        </div>
-        """,
-        unsafe_allow_html=True,
+```text
+OCI Identity Domain
+  usuario + MFA + ciclo de vida
+           │
+           ├── grupos ERP_ROLE_* ──> rol ERP existente
+           │                            └── DROLFUNC ──> privilegios concretos
+           └── atributos/claims estables: externalId, organización, colectivo...
+```
+"""
     )
-
-    fase_1, fase_2, fase_3 = st.columns(3)
-
-    fase_1.info(
-        """
-        **Fase 1 — Compatibilidad**
-
-        Crear un grupo OCI por cada rol ERP actual.
-
-        Permite una migración progresiva y reversible.
-        """
+    st.caption(
+        "Usa `externalId` como vínculo estable con el identificador ERP. Los atributos "
+        "organizativos deben proceder de una fuente maestra, no inferirse del nombre del rol."
     )
-
-    fase_2.info(
-        """
-        **Fase 2 — Normalización**
-
-        Definir familias y capacidades después de describir
-        correctamente las funciones.
-        """
-    )
-
-    fase_3.info(
-        """
-        **Fase 3 — Simplificación**
-
-        Retirar roles heredados sólo después de demostrar
-        equivalencia funcional.
-        """
-    )
-
-    st.subheader(
-        "Atributos Custom User propuestos"
-    )
-
-    atributos_personalizados = (
-        st.session_state.mapeo_atributos[
-            st.session_state.mapeo_atributos[
-                "esquema"
-            ] == "Custom User"
-        ]
-    )
-
-    st.dataframe(
-        atributos_personalizados[
-            [
-                "origen_erp",
-                "destino_oci",
-                "tipo_oci",
-                "claim_oidc",
-                "estado",
-                "observacion",
-            ]
-        ],
+    st.subheader("Propuesta editable: rol ERP → grupo OCI")
+    role_mapping = st.data_editor(
+        role_mapping_default,
+        use_container_width=True,
         hide_index=True,
+        num_rows="fixed",
+        key=f"role_mapping_{inventory.source_name}_{selected_environment}_{selected_date}",
+        height=480,
+    )
+    st.subheader("Propuesta editable: privilegio → capacidad")
+    st.caption(
+        "Las capacidades se sugieren por palabras; `SIN_CLASIFICAR` exige decisión humana. "
+        "El destino inicial es mantener el privilegio concreto en el ERP."
+    )
+    capability_mapping = st.data_editor(
+        capability_mapping_default,
         use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key=f"capability_mapping_{inventory.source_name}_{selected_environment}_{selected_date}",
+        height=480,
     )
 
-    columna_json_1, columna_json_2 = st.columns(2)
-
-    json_esquema = json.dumps(
-        crear_json_esquema_personalizado(
-            st.session_state.mapeo_atributos
-        ),
-        ensure_ascii=False,
-        indent=2,
+with tab_export:
+    st.subheader("Descargar resultados")
+    st.write(
+        "El ZIP contiene tablas de análisis y propuestas editables. No contiene los CSV "
+        "originales, credenciales ni instrucciones que cambien el ERP u OCI."
     )
-
-    json_claims = json.dumps(
-        crear_json_claims(
-            st.session_state.mapeo_atributos
-        ),
-        ensure_ascii=False,
-        indent=2,
+    if "role_mapping" not in locals():
+        role_mapping = role_mapping_default
+    if "capability_mapping" not in locals():
+        capability_mapping = capability_mapping_default
+    role_candidates = summary[
+        (summary["USUARIOS"] <= int(low_use_limit))
+        | (summary["PRIVILEGIOS"] == 0)
+        | (summary["AVISOS_INTEGRIDAD"] > 0)
+        | summary["NOMBRE_A_REVISAR"]
+    ].copy()
+    export_bytes = make_export_zip(
+        snapshot,
+        role_candidates,
+        identical,
+        similar,
+        subsets,
+        covered_roles,
+        repeated_grants,
+        role_mapping,
+        capability_mapping,
     )
-
-    with columna_json_1:
-        st.markdown(
-            "#### Borrador de esquema SCIM"
-        )
-
-        st.code(
-            json_esquema,
-            language="json",
-        )
-
-        st.download_button(
-            "Descargar esquema SCIM",
-            data=json_esquema.encode("utf-8"),
-            file_name="oci_custom_schema_patch.json",
-            mime="application/json",
-        )
-
-    with columna_json_2:
-        st.markdown(
-            "#### Borrador de claims"
-        )
-
-        st.code(
-            json_claims,
-            language="json",
-        )
-
-        st.download_button(
-            "Descargar claims",
-            data=json_claims.encode("utf-8"),
-            file_name="oci_custom_claims.json",
-            mime="application/json",
-        )
-
-    st.warning(
-        "Estos JSON son documentación de diseño. No se aplican "
-        "automáticamente en OCI."
-    )
-
-
-# ============================================================
-# SIMULADOR DE TOKEN
-# ============================================================
-
-with tab_token:
-    st.subheader(
-        "Simulación de la identidad recibida por el ERP"
-    )
-
-    ids_usuarios = sorted(
-        usuarios_roles[
-            "ID_DUSUARIOS_FK"
-        ]
-        .dropna()
-        .astype(int)
-        .unique()
-    )
-
-    usuario_seleccionado = st.selectbox(
-        "Selecciona un ID de usuario ERP",
-        ids_usuarios,
-    )
-
-    ids_roles_usuario = (
-        usuarios_roles[
-            usuarios_roles["ID_DUSUARIOS_FK"]
-            == usuario_seleccionado
-        ]["ID_DROLES_FK"]
-        .dropna()
-        .astype(int)
-        .unique()
-        .tolist()
-    )
-
-    roles_usuario = (
-        st.session_state.mapeo_roles[
-            st.session_state.mapeo_roles[
-                "ID_DROLES"
-            ]
-            .astype(int)
-            .isin(ids_roles_usuario)
-        ]
-    )
-
-    ids_funciones_usuario: set[int] = set()
-
-    for id_rol in ids_roles_usuario:
-        ids_funciones_usuario |= (
-            funciones_por_rol.get(
-                id_rol,
-                set(),
-            )
-        )
-
-    funciones_usuario_clasificadas = (
-        st.session_state.mapeo_funciones[
-            st.session_state.mapeo_funciones[
-                "ID_DFUNCION"
-            ].isin(ids_funciones_usuario)
-            & st.session_state.mapeo_funciones[
-                "capacidad_objetivo"
-            ].ne("SIN_CLASIFICAR")
-            & st.session_state.mapeo_funciones[
-                "capacidad_objetivo"
-            ].ne("NO_MIGRAR_A_OCI")
-        ]
-    )
-
-    capacidades_usuario = sorted(
-        funciones_usuario_clasificadas[
-            "capacidad_objetivo"
-        ]
-        .dropna()
-        .unique()
-        .tolist()
-    )
-
-    token_simulado = {
-        "iss": "https://<identity-domain-url>/",
-        "sub": "<oci-user-guid>",
-        "aud": "<erp-client-id>",
-        "exp": 1893456000,
-        "iat": 1893452400,
-        "auth_time": 1893452300,
-        "amr": [
-            "pwd",
-            "mfa",
-        ],
-        "preferred_username":
-            "<pendiente-maestro-usuarios>",
-        "erp_user_id":
-            f"ERP:{usuario_seleccionado}",
-        "groups": (
-            roles_usuario[
-                "grupo_oci_propuesto"
-            ]
-            .dropna()
-            .tolist()
-        ),
-        "erp_families": sorted(
-            roles_usuario[
-                "familia_propuesta"
-            ]
-            .dropna()
-            .unique()
-            .tolist()
-        ),
-        "erp_capabilities":
-            capacidades_usuario,
-        "erp_tipo_usuario": "<pendiente>",
-        "erp_nivel": "<pendiente>",
-        "erp_codigo_mediador": "<pendiente>",
-        "erp_delegacion": "<pendiente>",
-        "erp_empresa": "<pendiente>",
-    }
-
-    izquierda, derecha = st.columns(2)
-
-    with izquierda:
-        st.code(
-            json.dumps(
-                token_simulado,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            language="json",
-        )
-
-    with derecha:
-        st.metric(
-            "Roles o grupos",
-            len(token_simulado["groups"]),
-        )
-
-        st.metric(
-            "Funciones ERP efectivas",
-            len(ids_funciones_usuario),
-        )
-
-        st.metric(
-            "Capacidades clasificadas",
-            len(capacidades_usuario),
-        )
-
-        st.dataframe(
-            roles_usuario[
-                [
-                    "CODIGROL",
-                    "familia_propuesta",
-                    "grupo_oci_propuesto",
-                    "estado_decision",
-                ]
-            ],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.info(
-        "El ERP debe validar la firma del token, el emisor, "
-        "la audiencia, la caducidad, nonce y state antes de "
-        "crear la sesión."
-    )
-
-
-# ============================================================
-# EXPORTACIÓN
-# ============================================================
-
-with tab_exportar:
-    st.subheader(
-        "Exportar decisiones"
-    )
-
-    roles_validados = int(
-        st.session_state.mapeo_roles[
-            "estado_decision"
-        ].eq("Validado").sum()
-    )
-
-    funciones_clasificadas = int(
-        st.session_state.mapeo_funciones[
-            "capacidad_objetivo"
-        ].ne("SIN_CLASIFICAR").sum()
-    )
-
-    atributos_validados = int(
-        st.session_state.mapeo_atributos[
-            "estado"
-        ].eq("Validado").sum()
-    )
-
-    columnas = st.columns(3)
-
-    columnas[0].metric(
-        "Roles validados",
-        (
-            f"{roles_validados}/"
-            f"{len(st.session_state.mapeo_roles)}"
-        ),
-    )
-
-    columnas[1].metric(
-        "Funciones clasificadas",
-        (
-            f"{funciones_clasificadas}/"
-            f"{len(st.session_state.mapeo_funciones)}"
-        ),
-    )
-
-    columnas[2].metric(
-        "Atributos validados",
-        (
-            f"{atributos_validados}/"
-            f"{len(st.session_state.mapeo_atributos)}"
-        ),
-    )
-
-    paquete = crear_paquete_exportacion(
-        st.session_state.mapeo_roles,
-        st.session_state.mapeo_funciones,
-        st.session_state.mapeo_atributos,
-        informe_calidad,
-    )
-
     st.download_button(
-        "Descargar todos los mapeos",
-        data=paquete,
-        file_name="mapeos_erp_oci_iam.zip",
+        "Descargar análisis en ZIP",
+        data=export_bytes,
+        file_name="analisis_erp_oci.zip",
         mime="application/zip",
-        use_container_width=True,
         type="primary",
-    )
-
-    columna_1, columna_2, columna_3 = st.columns(3)
-
-    columna_1.download_button(
-        "Descargar roles",
-        data=dataframe_csv(
-            st.session_state.mapeo_roles
-        ),
-        file_name="mapeo_roles_oci.csv",
-        mime="text/csv",
-    )
-
-    columna_2.download_button(
-        "Descargar funciones",
-        data=dataframe_csv(
-            st.session_state.mapeo_funciones
-        ),
-        file_name="mapeo_funciones_capacidades.csv",
-        mime="text/csv",
-    )
-
-    columna_3.download_button(
-        "Descargar atributos",
-        data=dataframe_csv(
-            st.session_state.mapeo_atributos
-        ),
-        file_name="mapeo_atributos_scim.csv",
-        mime="text/csv",
-    )
-
-    st.markdown(
-        """
-        <div class="aviso aviso-amarillo">
-            <b>Antes del piloto:</b> incorporar el maestro completo
-            de usuarios, describir las funciones, revisar permisos
-            críticos, comprobar segregación de funciones y validar
-            varios usuarios representativos antes y después.
-        </div>
-        """,
-        unsafe_allow_html=True,
     )
