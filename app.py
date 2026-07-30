@@ -334,7 +334,7 @@ st.markdown(
 st.markdown(
     """
     <div class="cabecera">
-        <h1>🔐 Mapa de identidad ERP → OCI IAM</h1>
+        <h1>Mapa de identidad ERP → OCI IAM</h1>
         <p>
             Analiza perfiles y funciones, compara variantes, diseña atributos
             SCIM y simula la información que recibirá el ERP mediante OIDC.
